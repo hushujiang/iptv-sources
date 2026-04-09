@@ -4,45 +4,37 @@
  * 流程：
  *  1. 访问 https://epg.pw/areas/cn.html?lang=zh-hans 提取频道 ID 与名称
  *  2. 对每个频道调用 https://epg.pw/api/epg.xml?lang=zh-hans&date=YYYYMMDD&channel_id=ID
- *  3. 使用 fast-xml-parser 解析各响应中的 <channel> 与 <programme> 节点
- *  4. 去重合并后由 XMLBuilder 输出一份完整的 XMLTV XML
+ *  3. 使用 xml2js 解析各响应中的 <channel> 与 <programme> 节点
+ *  4. 去重合并后由 Builder 输出一份完整的 XMLTV XML
  */
 
-import { XMLBuilder, XMLParser } from 'fast-xml-parser';
-
 import { writeEpgJsonFromXml } from '../file';
+import type { EpgChannelJson } from './parser';
+import { writeFile } from 'fs/promises';
+import path from 'path';
+import { mkdir } from 'fs/promises';
+import {
+  buildXmlDocument,
+  normalizeXmlList,
+  readXmlAttr,
+  readXmltvChannelName,
+  readXmltvProgrammeTitle,
+  parseXmltvRoot,
+  type XmltvChannelNode,
+  type XmltvNode,
+  type XmltvProgrammeNode,
+} from './xml';
+import { formatHourMinute, parseXmltvUtcTimestamp } from './time';
 
-/** 与 src/epgs/parser.ts 保持一致，便于结构一致 */
-const PW_EPG_PARSER_OPTIONS = {
-  ignoreAttributes: false,
-  attributeNamePrefix: '@_' as const,
-  /** 单条也解析为数组，避免手写分支 */
-  isArray: (tagName: string) => tagName === 'channel' || tagName === 'programme',
-};
-
-const epgPwParser = new XMLParser(PW_EPG_PARSER_OPTIONS);
-
-const epgPwBuilder = new XMLBuilder({
-  ignoreAttributes: false,
-  attributeNamePrefix: '@_',
-  suppressEmptyNode: true,
-});
-
-type EpgPwTvNode = {
-  channel?: unknown;
-  programme?: unknown;
-};
-
-interface EpgPwChannel {
+export interface EpgPwChannel {
   id: string;
   name: string;
 }
-
 /**
  * 从 epg.pw 频道列表页 HTML 中提取频道 ID 与名称
  * 链接格式: href="/last/464609.html?lang=zh-hans"
  */
-function parseChannelListFromHtml(html: string): EpgPwChannel[] {
+export function parseChannelListFromHtml(html: string): EpgPwChannel[] {
   const regex = /href="\/last\/(\d+)\.html\?lang=zh-hans"[^>]*>([^<]+)<\/a>/g;
   const channels: EpgPwChannel[] = [];
   const seen = new Set<string>();
@@ -78,36 +70,53 @@ async function fetchChannelEpg(channelId: string, date: string): Promise<string 
   }
 }
 
-function normalizeTagList<T>(node: unknown): T[] {
-  if (node === undefined || node === null) return [];
-  return Array.isArray(node) ? (node as T[]) : [node as T];
-}
-
-function channelIdFromNode(node: Record<string, unknown>): string | null {
-  const id = node['@_id'];
-  if (id === undefined || id === null) return null;
-  const s = String(id).trim();
-  return s || null;
+function channelIdFromNode(node: XmltvChannelNode): string | null {
+  return readXmlAttr(node, 'id') || null;
 }
 
 /**
  * 解析单份 epg.pw API 返回的 XMLTV 片段
+ * 该接口按 channel_id 请求，响应中只会包含当前频道的 <channel> 与其 <programme> 列表
  */
-function parsePwEpgXml(xml: string): {
-  channels: Record<string, unknown>[];
-  programmes: Record<string, unknown>[];
+export function parsePwEpgXml(xml: string): {
+  channel: XmltvChannelNode | null;
+  programmes: XmltvProgrammeNode[];
 } {
-  try {
-    const parsed = epgPwParser.parse(xml) as { tv?: EpgPwTvNode };
-    const tv = parsed?.tv;
-    if (!tv) return { channels: [], programmes: [] };
-    return {
-      channels: normalizeTagList<Record<string, unknown>>(tv.channel),
-      programmes: normalizeTagList<Record<string, unknown>>(tv.programme),
-    };
-  } catch {
-    return { channels: [], programmes: [] };
+  const tv = parseXmltvRoot(xml) as XmltvNode | null;
+  if (!tv) {
+    return { channel: null, programmes: [] };
   }
+
+  const [channel] = normalizeXmlList(tv.channel);
+
+  return {
+    channel: channel ?? null,
+    programmes: normalizeXmlList(tv.programme),
+  };
+}
+
+export function buildPwChannelJson(
+  channelNode: XmltvChannelNode | undefined,
+  programmes: XmltvProgrammeNode[]
+): EpgChannelJson {
+  const channel = readXmltvChannelName(channelNode).toLowerCase();
+
+  return {
+    channel,
+    epg_data: programmes
+      .map((programme) => {
+        const startTime = parseXmltvUtcTimestamp(readXmlAttr(programme, 'start'));
+        const endTime = parseXmltvUtcTimestamp(readXmlAttr(programme, 'stop'));
+        if (!startTime || !endTime) return null;
+
+        return {
+          start: formatHourMinute(startTime),
+          end: formatHourMinute(endTime),
+          title: readXmltvProgrammeTitle(programme),
+        };
+      })
+      .filter((item): item is EpgChannelJson['epg_data'][number] => item !== null),
+  };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -118,11 +127,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * @param batchSize - 并发请求数，默认 10
  * @param delayMs - 批次间延迟（毫秒），默认 300
  */
-export async function buildEpgPwXml(
-  dates?: string[],
-  batchSize = 10,
-  delayMs = 300
-): Promise<string> {
+export async function buildEpgPwXml(batchSize = 10, delayMs = 300): Promise<string> {
   console.log('[EPG.PW] Fetching channel list from https://epg.pw/areas/cn.html ...');
   const res = await fetch('https://epg.pw/areas/cn.html?lang=zh-hans', {
     signal: AbortSignal.timeout(30000),
@@ -137,13 +142,19 @@ export async function buildEpgPwXml(
     throw new Error('[EPG.PW] No channels found — page may require JavaScript rendering');
   }
 
-  if (!dates || dates.length === 0) {
-    dates = [formatDate(new Date())];
+  const dates: string[] = [];
+  const today = new Date();
+  for (let i = 0; i < 7; i++) {
+    const date = new Date(today);
+    date.setDate(today.getDate() + i);
+    dates.push(formatDate(date));
   }
 
   const seenChannelIds = new Set<string>();
-  const channelNodes: Record<string, unknown>[] = [];
-  const programmeNodes: Record<string, unknown>[] = [];
+  const channelNodes: XmltvChannelNode[] = [];
+  const programmeNodes: XmltvProgrammeNode[] = [];
+  // const epgDir = makeEpgDir();
+  const basePath = path.join(__dirname, '../../m3u/epg/pw-7');
 
   for (const date of dates) {
     console.log(`[EPG.PW] Fetching EPG for date ${date} ...`);
@@ -155,17 +166,23 @@ export async function buildEpgPwXml(
       for (const result of results) {
         if (result.status !== 'fulfilled' || !result.value) continue;
 
-        const { channels: chList, programmes: progList } = parsePwEpgXml(result.value);
+        const { channel, programmes } = parsePwEpgXml(result.value);
+        if (!channel) continue;
 
-        for (const ch of chList) {
-          const chId = channelIdFromNode(ch);
-          if (chId && !seenChannelIds.has(chId)) {
-            seenChannelIds.add(chId);
-            channelNodes.push(ch);
-          }
+        const channelId = channelIdFromNode(channel);
+        if (channelId && !seenChannelIds.has(channelId)) {
+          seenChannelIds.add(channelId);
+          channelNodes.push(channel);
         }
 
-        programmeNodes.push(...progList);
+        const json = buildPwChannelJson(channel, programmes);
+        const currentChannelName = json.channel;
+        const savePath = await mkdir(path.join(basePath, currentChannelName), { recursive: true });
+        await writeFile(
+          path.join(savePath as string, `${date}.json`),
+          JSON.stringify(json, null, 2)
+        );
+        programmeNodes.push(...programmes);
       }
 
       const progress = Math.min(i + batchSize, channels.length);
@@ -181,7 +198,7 @@ export async function buildEpgPwXml(
     `[EPG.PW] Done — ${seenChannelIds.size} channels, ${programmeNodes.length} programmes`
   );
 
-  const tvBody = epgPwBuilder.build({
+  const tvBody = buildXmlDocument({
     tv: {
       channel: channelNodes,
       programme: programmeNodes,
