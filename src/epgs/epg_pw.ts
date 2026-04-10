@@ -13,6 +13,7 @@ import type { EpgChannelJson } from './parser';
 import { writeFile } from 'fs/promises';
 import path from 'path';
 import { mkdir } from 'fs/promises';
+import { fileURLToPath } from 'url';
 import {
   buildXmlDocument,
   normalizeXmlList,
@@ -25,6 +26,9 @@ import {
   type XmltvProgrammeNode,
 } from './xml';
 import { formatHourMinute, parseXmltvUtcTimestamp } from './time';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 export interface EpgPwChannel {
   id: string;
@@ -158,7 +162,8 @@ export async function buildEpgPwXml(batchSize = 10, delayMs = 300): Promise<stri
 
   for (const date of dates) {
     console.log(`[EPG.PW] Fetching EPG for date ${date} ...`);
-
+    const savePath = path.join(basePath, date);
+    await mkdir(savePath, { recursive: true });
     for (let i = 0; i < channels.length; i += batchSize) {
       const batch = channels.slice(i, i + batchSize);
       const results = await Promise.allSettled(batch.map((ch) => fetchChannelEpg(ch.id, date)));
@@ -177,9 +182,9 @@ export async function buildEpgPwXml(batchSize = 10, delayMs = 300): Promise<stri
 
         const json = buildPwChannelJson(channel, programmes);
         const currentChannelName = json.channel;
-        const savePath = await mkdir(path.join(basePath, currentChannelName), { recursive: true });
+
         await writeFile(
-          path.join(savePath as string, `${date}.json`),
+          path.join(savePath as string, `${currentChannelName}.json`),
           JSON.stringify(json, null, 2)
         );
         programmeNodes.push(...programmes);
